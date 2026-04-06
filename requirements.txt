@@ -1,0 +1,46 @@
+# Core
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-community>=0.3.0
+
+# Weaviate RAG
+weaviate-client>=4.0.0
+langchain-weaviate>=0.0.3
+
+# Gemini embeddings
+google-generativeai>=0.8.0
+
+# TTS + Audio
+gTTS>=2.5.0
+pygame>=2.6.0
+
+# Speech-to-Text
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.26.0
+
+# Windows system control
+pycaw>=20230407
+comtypes>=1.4.0
+screen-brightness-control>=0.23.0
+psutil>=5.9.0
+pillow>=10.0.0          # screenshot
+
+# FastAPI
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# GUI
+PyQt5>=5.15.10
+PyQt5-Qt5>=5.15.2
+
+# Utils
+python-dotenv>=1.0.0
+requests>=2.32.0
+duckduckgo-search>=6.3.0
+transformers>=4.39.0
