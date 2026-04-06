@@ -2,7 +2,7 @@
 
 - **Team Name**: Team-19
 - **Team Members**: 
-    + Nguyễn Tiến Đạt - 
+    + Nguyễn Tiến Đạt - 2A202600217
     + Dương Trịnh Hoài An - 2A202600050
     + Trần Ngọc Hùng - 2A202600429
     + Bùi Đức Thắng - 2A202600002
