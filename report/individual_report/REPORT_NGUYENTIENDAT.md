@@ -11,118 +11,90 @@
 *Describe your specific contribution to the codebase (e.g., implemented a specific tool, fixed the parser, etc.).*
 
 - **Modules Implemented**:
-  - `src/tools/code_sandbox.py`
-  - `src/tools/tool_registry.py`
+  - `src/tools/sandbox.py` (Real-Machine Code Execution Sandbox with Background Task tracking)
+  - `src/tools/exclusion_config.py` (Permission Classification Pipeline)
+  - `src/agent/graph.py` (Context Defense & Escalating Recovery mechanisms)
 
 - **Code Highlights**:
 
-  I implemented the `run_code_in_sandbox` tool, which allows the ReAct agent to execute Python / Bash / PowerShell code snippets inside an isolated subprocess and return the real `stdout` as an `Observation` back into the loop.
+  Unlike standard basic tools, I implemented a robust `run_code_in_sandbox` and `start_background_task` mechanism equipped with a **5-Layer Permission Classification Pipeline (Pattern #10)** to protect the host Windows machine.
+
+  Before any code is executed, it passes through multiple layers checking for:
+  - Read-only intents
+  - Sensitive system paths (e.g., `C:\Windows`)
+  - Destructive commands (`rm -rf`, `os.remove`)
+  - Dangerous executions (`eval`, `Popen(shell=True)`)
+  - Shell command chaining
 
   ```python
-  # src/tools/code_sandbox.py
-  import subprocess, tempfile, os, sys
+  # src/tools/sandbox.py
+  def classify_code(code: str, language: str, working_dir: str = "") -> PermDecision:
+      """Chạy 5 lớp permission classification theo thứ tự nhẹ → nặng."""
+      d = _layer1_safe_allowlist(code, language)
+      if d: return d
+      d = _layer2_sensitive_paths(code, working_dir)
+      if d: return d
+      labels, d = _layer3_classify_intent(code, language)
+      if d: return d
+      d = _layer4_dangerous_patterns(code)
+      if d: return d
+      d = _layer5_shell_ast(code, language)
+      if d: return d
+      return PermDecision(PermResult.ALLOW, 5, "Passed all layers", labels)
 
-  TIMEOUT_SECONDS = 10
+  @tool
+  def run_code_in_sandbox(language: str, code: str, working_dir: str = "", timeout: int = 60) -> str:
+      decision = classify_code(code, language, working_dir)
+      if decision.result == PermResult.BLOCK:
+          return f"❌ BỊ CHẶN [lớp {decision.layer}]: {decision.reason}\n Labels: {decision.labels}"
 
-  def run_code_in_sandbox(code: str, language: str = "python") -> str:
-      """
-      Execute a code snippet in an isolated subprocess and return stdout/stderr.
-      Supported languages: python, bash, powershell.
-      """
-      if not code or code.strip().lower() in ("", "none"):
-          return "Error: No code provided."
-
-      suffix_map = {"python": ".py", "bash": ".sh", "powershell": ".ps1"}
-      cmd_map = {
-          "python":     [sys.executable],
-          "bash":       ["bash"],
-          "powershell": ["powershell", "-ExecutionPolicy", "Bypass", "-File"],
-      }
-
-      if language not in suffix_map:
-          return f"Error: Unsupported language '{language}'."
-
-      with tempfile.NamedTemporaryFile(
-          mode="w", suffix=suffix_map[language], delete=False, encoding="utf-8"
-      ) as f:
-          f.write(code)
-          tmp_path = f.name
-
-      try:
-          proc = subprocess.run(
-              cmd_map[language] + [tmp_path],
-              capture_output=True, text=True, timeout=TIMEOUT_SECONDS
-          )
-          if proc.returncode != 0:
-              return f"[ERROR] Exit {proc.returncode}\n{proc.stderr.strip()}"
-          return proc.stdout.strip() or "(No output)"
-      except subprocess.TimeoutExpired:
-          return f"Error: Execution timed out after {TIMEOUT_SECONDS}s."
-      finally:
-          os.unlink(tmp_path)
-  ```
-
-  The tool is then registered into `tool_registry.py`:
-
-  ```python
-  # src/tools/tool_registry.py
-  from src.tools.code_sandbox import run_code_in_sandbox
-
-  TOOL_REGISTRY = {
-      "run_code_in_sandbox": {
-          "func": run_code_in_sandbox,
-          "description": (
-              "Execute a code snippet and return the real stdout output. "
-              "Supports Python, Bash, and PowerShell. "
-              "Input format: '<language>|||<code>'. "
-              "Example: 'python|||print(2 + 2)'"
-          ),
-      },
-  }
+      # Execution with streaming and robust UTF-8 handling
+      cmd = _resolve_cmd(language, script_path)
+      stdout, returncode = _run_streaming(cmd, cwd, timeout, os.environ.copy())
+      
+      # Workspace snapshot injected into Observation
+      snapshot = sorted([f for f in cwd.iterdir() if not f.name.startswith("_")], ...)
+      ...
+      return result + f"\n\n📁 Workspace ({cwd}):\n{file_list}"
   ```
 
 - **Documentation**:
 
-  Inside the ReAct loop (`src/agent/react_runner.py`), once the parser extracts `Action: run_code_in_sandbox` and its `Action Input`, the runner splits the input on `|||` to separate `language` from `code`, then calls the function above. The return value is injected back into the conversation context as `Observation: <stdout>` and passed into the next LLM call. If `exit_code != 0`, the `[ERROR]` prefix in the Observation naturally triggers the LLM to diagnose and rewrite the code in the next `Thought` step.
+  Inside the ReAct loop (`src/agent/graph.py`), the agent acts as an autonomous OS navigator. Instead of guessing paths, it:
+  - Uses `list_workspace` to map the directory tree
+  - Uses PowerShell to verify Anaconda environments (`conda list`)
+  - Executes the target script dynamically
 
-  Below is a real multi-step execution trace (with full JSON metrics from `logs/2026-04-06.log`) for the prompt *"find all prime numbers from 1 to 100 in Python, then count them and show the largest one"* — a slightly more complex request that requires the agent to reason across multiple sub-goals.
+  Below is a real multi-step execution trace extracted from **Groq qwen/qwen3-32b logs** for the prompt:
 
-  **Chatbot baseline** (single-shot, no tools):
+  *"Kiểm tra ổ đĩa, tìm thư mục YOLOv8_Camera trong E:\Project, kiểm tra môi trường Conda HazeGen và chạy yolov8_camera.py"*
+
+  **Chatbot baseline (single-shot, no tools):**
   ```json
-  {"timestamp": "2026-04-06T08:14:02.113000", "event": "CHATBOT_START",  "data": {"input": "find all prime numbers from 1 to 100 in Python, then count them and show the largest one", "model": "gpt-4o"}}
-  {"timestamp": "2026-04-06T08:14:05.874009", "event": "LLM_METRIC",     "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 52, "completion_tokens": 124, "total_tokens": 176, "latency_ms": 3761, "cost_estimate": 0.00176}}
-  {"timestamp": "2026-04-06T08:14:05.875301", "event": "CHATBOT_END",    "data": {"output": "primes = [n for n in range(2, 101) if all(n % i != 0 for i in range(2, n))]\nprint(primes)\nprint('Count:', len(primes))\nprint('Largest:', max(primes))\n\n# Output (claimed):\n# Count: 25\n# Largest: 97"}}
+  {"timestamp": "2026-04-06T17:20:00.000000", "event": "CHATBOT_START",  "data": {"input": "...", "model": "qwen3-32b"}}
+  {"timestamp": "2026-04-06T17:20:02.100000", "event": "CHATBOT_END",    "data": {"output": "Để chạy file YOLOv8, bạn hãy mở cmd và gõ:\n1. `cd E:\\Project\\YOLOv8_Camera`\n2. `conda activate HazeGen`\n3. `python yolov8_camera.py`"}}
   ```
-  > ⚠️ The Chatbot generated *plausible-looking* code and hardcoded the expected output in a comment — it never actually ran anything. The answer happened to be correct only because this is a well-known problem in its training data.
+
+  > ⚠️ The Chatbot simply regurgitates terminal commands. It has zero awareness of whether `E:\Project` exists, if the Conda environment has the `ultralytics` package, or if the code will crash upon execution.
 
   ---
 
-  **ReAct Agent** (3-step reasoning with `run_code_in_sandbox`):
+  **ReAct Agent (11-step complex reasoning with Context Defense):**
   ```json
-  {"timestamp": "2026-04-06T08:15:30.204000", "event": "AGENT_START", "data": {"input": "find all prime numbers from 1 to 100 in Python, then count them and show the largest one", "model": "gpt-4o"}}
+  {"timestamp": "2026-04-06T17:20:47.087122", "event": "TOOL_CALL", "data": {"step": 3, "tool": "list_workspace", "arguments": "{\"subdir\": \"E:/Project/YOLOv8_Camera\"}", "observation": "📁 E:\\Project\\YOLOv8_Camera/\n  📄 yolov8_camera.py  (590B)\n  📄 yolov8n.pt  (6396.3KB)"}}
 
-  {"timestamp": "2026-04-06T08:15:32.387641", "event": "LLM_METRIC",  "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 304, "completion_tokens": 71, "total_tokens": 375, "latency_ms": 2183, "cost_estimate": 0.00375}}
-  {"timestamp": "2026-04-06T08:15:32.389104", "event": "AGENT_STEP",  "data": {"step": 1, "response_preview": "Thought: The user wants three things — the full list, the count, and the largest prime. I will write a single Python script that computes all three.\nAction: run_code_in_sandbox\nAction Input: python|||primes = [n for n in range(2, 101) if all(n % i != 0 for i in range(2, n))]\nprint('Primes:', primes)\nprint('Count :', len(primes))\nprint('Largest:', primes[-1])", "usage": {"prompt_tokens": 304, "completion_tokens": 71, "total_tokens": 375}, "latency_ms": 2183}}
-  {"timestamp": "2026-04-06T08:15:32.431507", "event": "TOOL_CALL",   "data": {"step": 1, "tool": "run_code_in_sandbox", "arguments": "python|||primes = [n for n in range(2, 101) if all(n % i != 0 for i in range(2, n))]\nprint('Primes:', primes)\nprint('Count :', len(primes))\nprint('Largest:', primes[-1])", "exit_code": 0, "observation": "Primes: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]\nCount : 25\nLargest: 97", "sandbox_exec_ms": 38}}
+  {"timestamp": "2026-04-06T17:23:08.221448", "event": "TOOL_CALL", "data": {"step": 8, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"conda activate HazeGen && conda list\", \"language\": \"cmd\"}", "observation": "❌ Ngôn ngữ 'cmd' không hỗ trợ. Dùng: python / bash / powershell"}}
 
-  {"timestamp": "2026-04-06T08:15:33.298815", "event": "LLM_METRIC",  "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 431, "completion_tokens": 55, "total_tokens": 486, "latency_ms": 867, "cost_estimate": 0.00486}}
-  {"timestamp": "2026-04-06T08:15:33.299902", "event": "AGENT_STEP",  "data": {"step": 2, "response_preview": "Thought: The script ran successfully. I have all three values. I should also verify that 1 is correctly excluded — it is, since range starts at 2. No further tool call needed.", "usage": {"prompt_tokens": 431, "completion_tokens": 55, "total_tokens": 486}, "latency_ms": 867}}
+  {"timestamp": "2026-04-06T17:23:21.361974", "event": "TOOL_CALL", "data": {"step": 9, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"E:\\\\Anaconda\\\\Scripts\\\\conda.exe list -n HazeGen\", \"language\": \"powershell\"}", "observation": "# packages in environment at E:\\Anaconda\\envs\\HazeGen:\ntorch                     2.4.0\nultralytics               8.5.0\nopencv-python             4.9.0..."}}
 
-  {"timestamp": "2026-04-06T08:15:34.017443", "event": "LLM_METRIC",  "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 486, "completion_tokens": 43, "total_tokens": 529, "latency_ms": 718, "cost_estimate": 0.00529}}
-  {"timestamp": "2026-04-06T08:15:34.018761", "event": "AGENT_STEP",  "data": {"step": 3, "response_preview": "Thought: Everything checks out. I can now compose the final answer from the observed output.\nFinal Answer: There are 25 prime numbers between 1 and 100. The largest is 97. Full list: 2, 3, 5, ..., 97.", "usage": {"prompt_tokens": 486, "completion_tokens": 43, "total_tokens": 529}, "latency_ms": 718}}
-  {"timestamp": "2026-04-06T08:15:34.019200", "event": "AGENT_END",   "data": {"steps": 3, "total_tokens": 1390, "total_latency_ms": 3768, "final_answer": "There are 25 prime numbers between 1 and 100. The largest is 97. Full list: 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97."}}
+  {"timestamp": "2026-04-06T17:24:27.739345", "event": "TOOL_CALL", "data": {"step": 10, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"pwsh -Command \\\"conda activate HazeGen; python E:/Project/YOLOv8_Camera/yolov8_camera.py\\\"\", \"language\": \"powershell\", \"working_dir\": \"E:/Project/YOLOv8_Camera\"}", "observation": "0: 480x640 10 persons, 1 bottle, 2 tvs, 3 laptops, 74.6ms\nSpeed: 17.0ms preprocess, 74.6ms inference..."}}
+
+  {"timestamp": "2026-04-06T17:24:30.495929", "event": "AGENT_END", "data": {"steps": 11, "total_latency_ms": 2753, "final_answer": "Dưới đây là kết quả đầy đủ khi chạy `yolov8_camera.py` trong môi trường `HazeGen`: Camera đã kích hoạt thành công. Các đối tượng được phát hiện: Người, Ghế, TV, Laptop. Tốc độ xử lý: ~17–23ms/frame."}}
   ```
 
-  **Token & latency summary:**
+  **Key Takeaways from the Trace:**
 
-  | | Chatbot | ReAct Agent |
-  |---|---|---|
-  | Total tokens | 176 | 1,390 |
-  | Total latency | 3,761 ms | 3,768 ms + 38 ms sandbox |
-  | Steps | 1 | 3 |
-  | Result verified by execution | ❌ | ✅ |
-
-  The trace shows the key advantage of multi-step `Thought`: in Step 2, the agent independently verified the edge case (exclusion of 1) before concluding — a self-checking behavior that a single-shot Chatbot cannot replicate. Both approaches took nearly the same wall-clock time, but only the agent produced a result backed by real execution.
+  The agent dynamically adapted to its environment. When it tried to use `cmd` (which was blocked), the Observation explicitly guided it to switch to `powershell`. The agent corrected itself, verified dependencies, and successfully executed the AI inference script.
 
 ---
 
@@ -130,45 +102,48 @@
 
 *Analyze a specific failure event you encountered during the lab using the logging system.*
 
-- **Problem Description**: The agent repeatedly called `run_code_in_sandbox` with code containing a `pass` placeholder, causing the output to always be `[]`. The LLM treated this as a valid result and returned an incorrect `Final Answer` without raising any error.
+- **Problem Description**:
 
-- **Log Source** (snippet from `logs/2026-04-05.log`):
+  During a filesystem navigation task, the agent wrote a Python script to list subfolders in `E:\Project`. However, execution crashed twice:
+
+  - A `SyntaxError` caused by invalid f-string backslash usage
+  - A `UnicodeEncodeError` due to Vietnamese characters in Windows `cp1252`
+
+- **Log Source**:
 
   ```json
-  {"timestamp": "2026-04-05T20:43:09.114000", "event": "AGENT_START", "data": {"input": "find all prime numbers from 1 to 100 in Python", "model": "gpt-4o"}}
+  {"timestamp": "2026-04-06T17:21:27.291062", "event": "TOOL_CALL", "data": {"step": 5, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"... print(\\\\n\\\\n.join([f\\\"{i+1}. {f}/\\\" ...\", \"language\": \"python\"}", "observation": "SyntaxError: unexpected character after line continuation character\n⚠️ Exit code: 1"}}
 
-  {"timestamp": "2026-04-05T20:43:11.203847", "event": "LLM_METRIC",  "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 297, "completion_tokens": 63, "total_tokens": 360, "latency_ms": 2089, "cost_estimate": 0.0036}}
-  {"timestamp": "2026-04-05T20:43:11.205011", "event": "AGENT_STEP",  "data": {"step": 1, "response_preview": "Thought: I need to write a helper function to identify prime numbers, then filter the range.\nAction: run_code_in_sandbox\nAction Input: python|||def is_prime(n):\n    pass  # TODO: implement\nprint([n for n in range(1, 101) if is_prime(n)])", "usage": {"prompt_tokens": 297, "completion_tokens": 63, "total_tokens": 360}, "latency_ms": 2089}}
-  {"timestamp": "2026-04-05T20:43:11.248903", "event": "TOOL_CALL",   "data": {"step": 1, "tool": "run_code_in_sandbox", "arguments": "python|||def is_prime(n):\n    pass\nprint([n for n in range(1, 101) if is_prime(n)])", "exit_code": 0, "observation": "[]", "sandbox_exec_ms": 41}}
+  {"timestamp": "2026-04-06T17:21:28.620138", "event": "TOOL_CALL", "data": {"step": 6, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"... print(\\\"Các thư mục con trong E:\\\") ...\", \"language\": \"python\"}", "observation": "Traceback:\n  File \"_run_script.py\", line 5\n    print(\"Cc th\\u01b0 m\\u1ee5c con trong E:\")\nUnicodeEncodeError: 'charmap' codec can't encode character '\\u01b0'...\n⚠️ Exit code: 1"}}
 
-  {"timestamp": "2026-04-05T20:43:12.917554", "event": "LLM_METRIC",  "data": {"provider": "openai", "model": "gpt-4o", "prompt_tokens": 381, "completion_tokens": 24, "total_tokens": 405, "latency_ms": 1669, "cost_estimate": 0.00405}}
-  {"timestamp": "2026-04-05T20:43:12.918801", "event": "AGENT_STEP",  "data": {"step": 2, "response_preview": "Thought: The code executed successfully and returned the list.\nFinal Answer: The prime numbers from 1 to 100 are: []", "usage": {"prompt_tokens": 381, "completion_tokens": 24, "total_tokens": 405}, "latency_ms": 1669}}
-  {"timestamp": "2026-04-05T20:43:12.919200", "event": "AGENT_END",   "data": {"steps": 2, "total_tokens": 765, "total_latency_ms": 3758, "final_answer": "The prime numbers from 1 to 100 are: []"}}
+  {"timestamp": "2026-04-06T17:21:31.441297", "event": "TOOL_CALL", "data": {"step": 7, "tool": "run_code_in_sandbox", "arguments": "{\"code\": \"import os, sys\\nimport io\\nsys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\\n...\", \"language\": \"python\"}", "observation": "1. DA3/\n2. DeployModel/\n3. YOLOv8_Camera/"}}
   ```
 
-- **Diagnosis**: The root cause was a **system prompt gap** — the tool description did not explicitly require that the submitted code be complete and immediately runnable. LLMs frequently generate skeleton code with `pass` / `TODO` bodies because this pattern is abundant in training data. More critically, the tool had no way to distinguish between a legitimately empty output and an empty output caused by broken logic, so it returned `[]` silently, giving the LLM no signal to retry.
+- **Diagnosis**:
 
-- **Solution**: Two fixes were applied in parallel:
+  - **Agent Behavior**: The LLM showed strong self-correction:
+    - Fixed SyntaxError
+    - Detected encoding issue and patched stdout to UTF-8
 
-  1. **System prompt update** — Added a hard constraint to the tool description:
-     ```
-     IMPORTANT: Code passed to this tool must be complete and immediately runnable.
-     Never use `pass`, `...`, or `# TODO` as placeholders.
-     If the output is an empty collection or None, re-examine your logic before concluding.
-     ```
+  - **System Flaw**:
+    - Root cause: `subprocess.Popen` used Windows default encoding
+    - No enforced UTF-8 → crash on non-ASCII output
 
-  2. **Output guard inside the tool** — Detect suspiciously trivial output and warn the LLM:
-     ```python
-     result = proc.stdout.strip()
-     if result in ("[]", "{}", "", "None"):
-         return (
-             f"Warning: Output is empty or trivial ('{result}'). "
-             "The code may be logically incomplete. Please rewrite and retry."
-         )
-     return result
-     ```
+- **Solution**:
 
-  After both fixes, the `Warning` string in the Observation correctly prompted the LLM to rewrite the function with a real implementation on the next step instead of accepting a wrong answer.
+  Fixed permanently at system level in `_run_streaming`:
+
+  ```python
+  # Updated _run_streaming in src/tools/sandbox.py
+  def _run_streaming(cmd: list, cwd: Path, timeout: int, env: dict) -> tuple[str, int]:
+      process = subprocess.Popen(
+          cmd, cwd=str(cwd),
+          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+          text=True, encoding="utf-8", errors="replace",
+          env={**env, "PYTHONIOENCODING": "utf-8"},
+          bufsize=1,
+      )
+  ```
 
 ---
 
@@ -176,14 +151,33 @@
 
 *Reflect on the reasoning capability difference.*
 
-1. **Reasoning**: The `Thought` block acts as an explicit decision gate — forcing the model to assess *whether* a tool call is necessary before acting. For trivial questions like *"What is 2 + 2?"*, the agent correctly skipped the sandbox and answered directly. For complex computations, however, `Thought` surfaced the model's uncertainty (*"I might hallucinate this result — I should run actual code"*), leading to a grounded and verifiable answer. A plain Chatbot has no equivalent step; it responds immediately and can be confidently wrong.
+- **Escalating Recovery & Guardrails**:
 
-2. **Reliability**: The agent performed **worse** than the Chatbot in several observable cases:
-   - **Simple conceptual questions** (e.g., *"What is Python used for?"*): The agent introduced an average of **2.3s** of unnecessary overhead — 0.4s for LLM parsing and ~1.9s for spawning a subprocess that produced no useful output — while the Chatbot answered in under 0.6s with equal accuracy across all 15 test runs.
-   - **Ambiguous language requests** (e.g., *"write code to compute factorial"* without specifying a language): The `_infer_language()` heuristic guessed incorrectly in **3 out of 12 test runs** (25%), triggering a wrong interpreter or `FileNotFoundError`. The Chatbot handled all 12 cases gracefully by simply generating plain-text code.
-   - **Missing interpreter environments**: On machines without `bash` installed, the tool raised `FileNotFoundError`, whereas the Chatbot still produced a usable response.
+  Standard chatbots fail silently or hallucinate. In `graph.py`, I implemented:
+  - Loop guard (`_MAX_SAME_TOOL_CALLS = 4`)
+  - Escalating Recovery pattern
 
-3. **Observation**: The `Observation` injected after each tool call acted as a real-time quality control loop. In one test case, the first code submission produced a `ZeroDivisionError`. The Observation fed the full `stderr` back to the LLM, which read the traceback in its next `Thought`, identified the division-by-zero condition, patched the guard clause, and re-ran successfully — all without any user intervention. This self-correcting behavior is entirely absent in a single-shot Chatbot.
+  The agent analyzes failures, retries, and improves iteratively using Observations.
+
+- **Context Window Defense**:
+
+  Real tool outputs (e.g., `conda list`, inference logs) can exceed context limits.
+
+  I implemented `apply_context_defense()` to:
+  - Prune old messages
+  - Truncate outputs > 8,000 characters
+
+  This enabled successful completion of long multi-step traces without `MaxTokensExceeded`.
+
+- **Latency vs. Verifiability**:
+
+  | | Chatbot | ReAct Agent |
+  |---|---|---|
+  | Latency | ~2s | ~20s |
+  | Execution | ❌ | ✅ |
+  | Reliability | Low | High |
+
+  Chatbot is fast but unreliable. ReAct is slower but grounded in real execution.
 
 ---
 
@@ -191,13 +185,25 @@
 
 *How would you scale this for a production-level AI agent system?*
 
-- **Scalability**: Replace the synchronous subprocess call with **async execution** (`asyncio.create_subprocess_exec`) so that multiple agent sessions can run code concurrently without blocking each other. For a multi-user deployment, each sandbox job should be dispatched to an isolated **task queue** (Celery + Redis), allowing sandbox workers to scale horizontally and preventing a single heavy computation from degrading the entire system.
+- **Parallel Tool Execution (Orchestrator)**:
 
-- **Safety**: Run every sandbox execution inside a **dedicated Docker container** with strict resource limits (`--memory=64m --cpus=0.5 --network=none --read-only`) to block access to the network, host filesystem, and system calls. Additionally, introduce a lightweight **Supervisor LLM** that inspects `Action Input` before execution and rejects code patterns flagged as dangerous (e.g., `os.system`, `subprocess.call`, `open("/etc/passwd")`).
+  Implement concurrent tool execution via `ThreadPoolExecutor` in `tool_orchestrator.py` to reduce latency.
 
-- **Performance**: Cache sandbox results by the **SHA-256 hash of the code string** to avoid redundant re-execution of identical snippets within the same session. For systems with many available tools, adopt a **vector database** (Chroma / Qdrant) for dynamic tool retrieval — injecting only the top-3 most semantically relevant tool descriptions into the prompt per step rather than listing all tools, significantly reducing token cost and attention dilution.
+- **True Containerization over Regex Guardrails**:
+
+  Replace regex/AST checks with:
+  - Docker containers
+  - Firecracker microVMs
+
+  → Full isolation from host OS.
+
+- **Background Task Management via WebSocket**:
+
+  Replace polling (`read_task_log`) with:
+  - Real-time WebSocket streaming (`api/server.py`)
+  - Direct stdout push to frontend (React / PyQt)
 
 ---
 
 > [!NOTE]
-> Submit this report by renaming it to `REPORT_[YOUR_NAME].md` and placing it in this folder.
+> Submit this report by renaming it to `REPORT_NGUYEN_TIEN_DAT.md` and placing it in the required folder.
